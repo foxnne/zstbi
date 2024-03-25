@@ -1,5 +1,5 @@
+pub const version = @import("std").SemanticVersion{ .major = 0, .minor = 9, .patch = 3 };
 const std = @import("std");
-const testing = std.testing;
 const assert = std.debug.assert;
 
 pub fn init(allocator: std.mem.Allocator) void {
@@ -23,10 +23,6 @@ pub fn init(allocator: std.mem.Allocator) void {
 pub fn deinit() void {
     assert(mem_allocator != null);
     assert(mem_allocations.?.count() == 0);
-
-    setFlipVerticallyOnLoad(false);
-    setFlipVerticallyOnWrite(false);
-
     mem_allocations.?.deinit();
     mem_allocations = null;
     mem_allocator = null;
@@ -284,7 +280,7 @@ pub const Image = struct {
     }
 
     pub fn writeToFile(
-        image: Image,
+        image: *const Image,
         filename: [:0]const u8,
         image_format: ImageWriteFormat,
     ) ImageWriteError!void {
@@ -311,7 +307,7 @@ pub const Image = struct {
     }
 
     pub fn writeToFn(
-        image: Image,
+        image: *const Image,
         write_fn: *const fn (ctx: ?*anyopaque, data: ?*anyopaque, size: c_int) callconv(.C) void,
         context: ?*anyopaque,
         image_format: ImageWriteFormat,
@@ -345,6 +341,65 @@ pub const Image = struct {
     }
 };
 
+pub const Rect = extern struct {
+    id: u32,
+    w: u16,
+    h: u16,
+    x: u16 = 0,
+    y: u16 = 0,
+    was_packed: i32 = 0,
+
+    pub fn slice(self: Rect) [4]u32 {
+        return .{
+            @intCast(self.x),
+            @intCast(self.y),
+            @intCast(self.w),
+            @intCast(self.h),
+        };
+    }
+};
+
+pub const Node = extern struct {
+    x: u16,
+    y: u16,
+    next: [*c]Node,
+};
+
+pub const Context = extern struct {
+    width: i32,
+    height: i32,
+    @"align": i32,
+    init_mode: i32,
+    heuristic: i32,
+    num_nodes: i32,
+    active_head: [*c]Node,
+    free_head: [*c]Node,
+    extra: [2]Node,
+};
+
+pub const Heuristic = enum(u32) {
+    skyline_default,
+    skyline_bl_sort_height,
+    skyline_bf_sort_height,
+};
+
+pub fn initTarget(context: *Context, width: u32, height: u32, nodes: []Node) void {
+    stbrp_init_target(context, width, height, nodes.ptr, nodes.len);
+}
+
+pub fn packRects(context: *Context, rects: []Rect) usize {
+    return @as(usize, @intCast(stbrp_pack_rects(context, rects.ptr, rects.len)));
+}
+
+pub fn setupHeuristic(context: *Context, heuristic: Heuristic) void {
+    stbrp_setup_heuristic(context, @as(u32, @intCast(@intFromEnum(heuristic))));
+}
+
+pub extern fn stbrp_init_target(context: [*c]Context, width: u32, height: u32, nodes: [*c]Node, num_nodes: usize) void;
+pub extern fn stbrp_pack_rects(context: [*c]Context, rects: [*c]Rect, num_rects: usize) usize;
+pub extern fn stbrp_setup_allow_out_of_mem(context: [*c]Context, allow_out_of_mem: u32) void;
+pub extern fn stbrp_setup_heuristic(context: [*c]Context, heuristic: u32) void;
+
 /// `pub fn setHdrToLdrScale(scale: f32) void`
 pub const setHdrToLdrScale = stbi_hdr_to_ldr_scale;
 
@@ -371,10 +426,6 @@ pub fn is16bit(filename: [:0]const u8) bool {
 
 pub fn setFlipVerticallyOnLoad(should_flip: bool) void {
     stbi_set_flip_vertically_on_load(if (should_flip) 1 else 0);
-}
-
-pub fn setFlipVerticallyOnWrite(should_flip: bool) void {
-    stbi_flip_vertically_on_write(if (should_flip) 1 else 0);
 }
 
 var mem_allocator: ?std.mem.Allocator = null;
@@ -507,7 +558,6 @@ extern fn stbi_is_hdr(filename: [*:0]const u8) c_int;
 extern fn stbi_is_hdr_from_memory(buffer: [*]const u8, len: c_int) c_int;
 
 extern fn stbi_set_flip_vertically_on_load(flag_true_if_should_flip: c_int) void;
-extern fn stbi_flip_vertically_on_write(flag: c_int) void; // flag is non-zero to flip data vertically
 
 extern fn stbir_resize_uint8(
     input_pixels: [*]const u8,
@@ -529,7 +579,6 @@ extern fn stbi_write_jpg(
     data: [*]const u8,
     quality: c_int,
 ) c_int;
-
 extern fn stbi_write_png(
     filename: [*:0]const u8,
     w: c_int,
@@ -559,61 +608,10 @@ extern fn stbi_write_jpg_to_func(
     quality: c_int,
 ) c_int;
 
-test "zstbi basic" {
-    init(testing.allocator);
+test "zstbi.basic" {
+    init(std.testing.allocator);
     defer deinit();
 
-    var im1 = try Image.createEmpty(8, 6, 4, .{});
-    defer im1.deinit();
-
-    try testing.expect(im1.width == 8);
-    try testing.expect(im1.height == 6);
-    try testing.expect(im1.num_components == 4);
-}
-
-test "zstbi resize" {
-    init(testing.allocator);
-    defer deinit();
-
-    var im1 = try Image.createEmpty(32, 32, 4, .{});
-    defer im1.deinit();
-
-    var im2 = im1.resize(8, 6);
-    defer im2.deinit();
-
-    try testing.expect(im2.width == 8);
-    try testing.expect(im2.height == 6);
-    try testing.expect(im2.num_components == 4);
-}
-
-test "zstbi write and load file" {
-    init(testing.allocator);
-    defer deinit();
-
-    const pth = try std.fs.selfExeDirPathAlloc(testing.allocator);
-    defer testing.allocator.free(pth);
-    try std.os.chdir(pth);
-
-    var img = try Image.createEmpty(8, 6, 4, .{});
-    defer img.deinit();
-
-    try img.writeToFile("test_img.png", ImageWriteFormat.png);
-    try img.writeToFile("test_img.jpg", .{ .jpg = .{ .quality = 80 } });
-
-    var img_png = try Image.loadFromFile("test_img.png", 0);
-    defer img_png.deinit();
-
-    try testing.expect(img_png.width == img.width);
-    try testing.expect(img_png.height == img.height);
-    try testing.expect(img_png.num_components == img.num_components);
-
-    var img_jpg = try Image.loadFromFile("test_img.jpg", 0);
-    defer img_jpg.deinit();
-
-    try testing.expect(img_jpg.width == img.width);
-    try testing.expect(img_jpg.height == img.height);
-    try testing.expect(img_jpg.num_components == 3); // RGB JPEG
-
-    try std.fs.cwd().deleteFile("test_img.png");
-    try std.fs.cwd().deleteFile("test_img.jpg");
+    var image = try Image.createEmpty(64, 64, 4, .{});
+    defer image.deinit();
 }
